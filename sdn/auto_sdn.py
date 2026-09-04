@@ -4,7 +4,6 @@ import time
 import subprocess
 import json
 import sys
-import threading
 import base64
 import urllib.request
 import urllib.error
@@ -278,94 +277,6 @@ def install_slice_meters(user: str, password: str, dpid: str, specs) -> dict:
     return meter_ids
 
 
-def get_ue_tunnel_ip(container_name: str):
-    result = run(
-        f"docker exec {container_name} ip addr show uesimtun0 2>/dev/null",
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("inet "):
-            return line.split()[1].split("/")[0]
-    return None
-
-
-def remove_flows_for_ip(user: str, password: str, dpid: str, ue_ip: str):
-    data = _onos_request("GET", f"/onos/v1/flows/{dpid}", user, password)
-    if not data:
-        return
-    for flow in data.get("flows", []):
-        for c in flow.get("selector", {}).get("criteria", []):
-            if c.get("type") in ("IPV4_SRC", "IPV4_DST"):
-                if c.get("ip", "").split("/")[0] == ue_ip:
-                    flow_id = flow.get("id")
-                    if flow_id:
-                        _onos_request("DELETE", f"/onos/v1/flows/{dpid}/{flow_id}", user, password)
-                    break
-
-
-def install_ue_flows(user: str, password: str, dpid: str,
-                     ue_ip: str, deny_subnets: list, port_ue: str, port_core: str, meter_id=None):
-    flows = []
-    for deny_subnet in deny_subnets:
-        flows.append({
-            "priority": 200, "isPermanent": True,
-            "selector": {"criteria": [
-                {"type": "ETH_TYPE", "ethType": "0x0800"},
-                {"type": "IPV4_SRC", "ip": f"{ue_ip}/32"},
-                {"type": "IPV4_DST", "ip": deny_subnet},
-            ]},
-            "treatment": {"instructions": [{"type": "NOACTION"}]},
-        })
-    flows += [
-        {
-            "priority": 100, "isPermanent": True,
-            "selector": {"criteria": [
-                {"type": "ETH_TYPE", "ethType": "0x0800"},
-                {"type": "IPV4_SRC", "ip": f"{ue_ip}/32"},
-            ]},
-            "treatment": {"instructions": _output_instrs(port_core, meter_id)},
-        },
-        {
-            "priority": 100, "isPermanent": True,
-            "selector": {"criteria": [
-                {"type": "ETH_TYPE", "ethType": "0x0800"},
-                {"type": "IPV4_DST", "ip": f"{ue_ip}/32"},
-            ]},
-            "treatment": {"instructions": _output_instrs(port_ue, meter_id)},
-        },
-    ]
-    for flow in flows:
-        _onos_request("POST", f"/onos/v1/flows/{dpid}", user, password, payload=flow)
-    print(f"[SDN] Flows instalados para {ue_ip}")
-
-
-def ue_session_listener(user: str, password: str, dpid: str, ue_configs: dict, stop_event):
-    ue_state = {name: None for name in ue_configs}
-    while not stop_event.is_set():
-        for cname, cfg in ue_configs.items():
-            current_ip = get_ue_tunnel_ip(cname)
-            prev_ip = ue_state[cname]
-            if current_ip == prev_ip:
-                continue
-            if prev_ip is not None:
-                remove_flows_for_ip(user, password, dpid, prev_ip)
-                if current_ip is None:
-                    install_ue_flows(user, password, dpid, cfg["mn_ip"], cfg["deny_subnets"],
-                                     cfg["port_ue"], cfg["port_core"], cfg["meter_id"])
-                    print(f"[SDN] {cname}: sessão encerrada — flows estáticos restaurados ({cfg['mn_ip']})")
-            if current_ip is not None:
-                if prev_ip is None:
-                    remove_flows_for_ip(user, password, dpid, cfg["mn_ip"])
-                install_ue_flows(user, password, dpid, current_ip, cfg["deny_subnets"],
-                                 cfg["port_ue"], cfg["port_core"], cfg["meter_id"])
-                print(f"[SDN] {cname}: sessão PDU ativa — flows dinâmicos instalados ({current_ip})")
-            ue_state[cname] = current_ip
-        stop_event.wait(1)
-
-
 def get_container_bridge_ip(container_name: str) -> str:
     result = run(
         f"docker inspect -f '{{{{.NetworkSettings.Networks.bridge.IPAddress}}}}' {container_name}",
@@ -391,6 +302,32 @@ def install_mgmt_isolation_rules(specs, bridge_ips: dict):
                 "-m comment --comment FAIR5G-SLICE-ISO-MGMT -j DROP"
             )
     print(f"Isolamento mgmt plane: {bridge_ips}")
+
+
+def install_upf_isolation_rules(specs):
+    # O isolamento precisa ser aplicado DENTRO do container da UPF, não no host: a UPF
+    # tem uma regra própria de MASQUERADE em POSTROUTING (`!ogstun 10.4X.0.0/16 -> 0.0.0.0/0`)
+    # que reescreve o IP de origem da sessão PDU antes do pacote chegar ao host. Regras no
+    # FORWARD do host casando em `-s 10.4X.0.0/16` nunca veem esse tráfego. Dentro da UPF o
+    # FORWARD roda antes do POSTROUTING, então o IP original ainda está visível.
+    for spec in specs:
+        cname = f"upf{spec.index}"
+        for other in other_subnets(specs, spec.index):
+            docker_exec(
+                cname,
+                f"while iptables -D FORWARD -s {spec.upf_subnet} -d {other} "
+                "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP 2>/dev/null; do :; done",
+                check=False,
+            )
+            result = docker_exec(
+                cname,
+                f"iptables -I FORWARD 1 -s {spec.upf_subnet} -d {other} "
+                "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP",
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"[AVISO] não consegui aplicar isolamento em {cname} → {other}")
+    print(f"Isolamento aplicado dentro das UPFs (antes do masquerade) em {len(specs)} fatia(s).")
 
 
 def cleanup_mgmt_isolation_rules():
@@ -526,7 +463,6 @@ def run_topology():
     user = os.getenv("FAIR5G_ONOS_USER", "onos")
     password = os.getenv("FAIR5G_ONOS_PASS", "rocks")
 
-    stop_event = None
     net = None
     try:
         print("Iniciando Topologia Mininet...")
@@ -577,33 +513,29 @@ def run_topology():
         # um UE (table-miss nunca ocorre para esse tráfego), então o forwarding reativo
         # só é de fato acionado para ARP — que não tem flow próprio e travava o
         # registro NGAP de todos os UEs (ver diagnóstico da sessão de 2026-08-17).
+        #
+        # Não há re-instalação dinâmica de flows por sessão PDU: o tráfego do UE, mesmo
+        # depois da sessão PDU ativa, sai do container sempre reencapsulado com o mesmo
+        # endereçamento externo (IP Mininet do UE -> IP do gNB) — o IP do túnel
+        # (uesimtun0) nunca aparece como cabeçalho externo no switch. Uma versão anterior
+        # tentava trocar os flows para casar no IP do túnel a cada sessão, o que removia
+        # as flows estáticas (que são as únicas que de fato batem) e deixava o fwd
+        # reativo — sem noção de isolamento — assumir esse tráfego. Resultado: isolamento
+        # cross-slice furado depois da primeira sessão PDU (confirmado em 2026-08-18 com
+        # contadores de pacote do ONOS zerados nas flows dinâmicas e ping cross-slice
+        # passando). As flows estáticas instaladas acima já cobrem 100% do tráfego real
+        # do UE permanentemente — não removê-las.
 
         print("Configurando isolamento mgmt plane...")
         bridge_ips = {spec.index: get_container_bridge_ip(f"mn.ue{spec.index}") for spec in specs}
         install_mgmt_isolation_rules(specs, bridge_ips)
 
+        print("Configurando isolamento do plano de dados nas UPFs...")
+        install_upf_isolation_rules(specs)
+
         print("Iniciando Conexao 5G (UERANSIM)...")
         for spec in specs:
             configure_ue(f"ue{spec.index}", f"ue{spec.index}.yaml")
-
-        ue_configs = {
-            f"mn.ue{spec.index}": {
-                "mn_ip": spec.ue_mininet_ip,
-                "port_ue": ports[spec.index],
-                "port_core": port_core,
-                "meter_id": meter_ids.get(spec.index),
-                "deny_subnets": other_subnets(specs, spec.index),
-            }
-            for spec in specs
-        }
-        stop_event = threading.Event()
-        listener_thread = threading.Thread(
-            target=ue_session_listener,
-            args=(user, password, dpid, ue_configs, stop_event),
-            daemon=True,
-        )
-        listener_thread.start()
-        print("Listener de sessões PDU iniciado.")
 
         print("\nAmbiente Pronto (Mininet)")
         print('Logs: ue1 sh -c "tail -f /tmp/ue1.log"')
@@ -615,8 +547,6 @@ def run_topology():
 
     finally:
         print("Limpando ambiente...")
-        if stop_event is not None:
-            stop_event.set()
         try:
             if net is not None:
                 net.stop()
