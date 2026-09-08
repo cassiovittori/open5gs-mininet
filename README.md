@@ -131,21 +131,21 @@ Quando cair no prompt `containernet>`:
 ue1 sh -c "tail -f /tmp/ue1.log"
 ```
 
-### Ping entre UEs (topologia SDN/switch)
+### Ping do UE para o gNB (único destino permitido)
+
+> O IP do gNB na rede de acesso aparece no log do render.
 
 ```bash
-ue1 ping -c 3 10.34.0.201
+ue1 ping -c 3 <IP_ACESSO_DO_GNB>
 ```
 
-### Ping do UE para o gNB
-
-> O IP do gNB aparece no log do render (ou nos logs do container do gNB).
+### Ping dentro da própria fatia (via sessão PDU)
 
 ```bash
-ue1 ping -c 3 <IP_DO_GNB>
+ue1 ping -c 3 -I uesimtun0 10.45.0.1
 ```
 
-**Nota:** ping UE↔UE valida links/switch. A conectividade “5G” (sessão PDU/rota via UPF) deve ser validada pelos logs do UERANSIM e serviços do Open5GS.
+**Nota:** ping UE↔UE **não funciona por design** — os flows do OVS usam whitelist, e o único destino permitido a um UE é o gNB (mais o probe do blackbox). Isso é mais fiel ao 5G real, onde dois UEs na mesma célula não se alcançam diretamente em nível IP: o tráfego sobe até a UPF. Para validar o caminho de dados, use o `-I uesimtun0` acima ou os logs do UERANSIM.
 
 ---
 
