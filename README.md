@@ -34,7 +34,18 @@ Ambiente automatizado (reprodutível) para subir um testbed 5G com **Open5GS (co
 
   * 1 switch OVS (OpenFlow13)
   * N UEs docker (`ue1`, `ue2`, ...) ligados ao switch — quantidade de fatias configurável via `--slices` (ver [Comandos](#comandos))
-  * “cabo” `veth-sdn` conectado à bridge da rede docker `open5gs`
+  * “cabo” `veth-sdn` conectado à bridge da rede de acesso (`fair5g-access`)
+
+### Separação acesso / core
+
+O testbed usa **duas redes Docker**, e essa separação é o que sustenta a afirmação de isolamento:
+
+| Rede | Subnet | Quem vive nela |
+|---|---|---|
+| `fair5g-access` | `10.34.0.0/24` | UEs (via switch OVS) + perna de rádio do gNB |
+| `open5gs` | `10.33.33.0/24` | Core (AMF, SMF, UPF, NRF, ...) + perna N2/N3 do gNB |
+
+O **gNB é dual-homed** e é a única travessia entre as duas — e faz isso em nível de aplicação (termina o link de rádio simulado de um lado, origina NGAP/GTP-U do outro), sem rotear pacotes entre as pernas. Consequência: um UE **não tem caminho IP até o core** — é inalcançável por topologia, não por regra de firewall. No `gnb.yaml`, `linkIp` fica na rede de acesso e `ngapIp`/`gtpIp` no core.
 
 ---
 
@@ -123,7 +134,7 @@ ue1 sh -c "tail -f /tmp/ue1.log"
 ### Ping entre UEs (topologia SDN/switch)
 
 ```bash
-ue1 ping -c 3 10.33.33.201
+ue1 ping -c 3 10.34.0.201
 ```
 
 ### Ping do UE para o gNB

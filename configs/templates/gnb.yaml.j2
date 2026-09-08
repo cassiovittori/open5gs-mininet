@@ -5,7 +5,10 @@ nci: '0x000000010'
 idLength: 32
 tac: 1
 
-linkIp: gnb.ueransim.org
+# linkIp = interface do link de rádio simulado com os UEs -> rede de ACESSO.
+# ngapIp/gtpIp = N2 (AMF) e N3 (UPF) -> rede do CORE.
+# Essa separação é o que mantém o core inalcançável a partir de um UE.
+linkIp: gnb.access
 ngapIp: gnb.ueransim.org
 gtpIp: gnb.ueransim.org
 

@@ -42,8 +42,20 @@ PROMETHEUS_URL  = os.environ.get("PROMETHEUS_URL",  "http://localhost:9090")
 GRAFANA_URL     = os.environ.get("GRAFANA_URL",     "http://localhost:3000")
 GRAFANA_DASHBOARD = os.environ.get("GRAFANA_DASHBOARD", "")
 
-UE1_IP = os.environ.get("UE1_IP", "10.33.33.200")
-UE2_IP = os.environ.get("UE2_IP", "10.33.33.201")
+# Derivado de core.slicing (fonte unica de verdade do enderecamento) em vez de
+# hardcoded: quando a subnet dos UEs muda, as queries acompanham sozinhas.
+def _ue_ip_defaults() -> dict:
+    try:
+        from .core.slicing import build_slice_specs, DEFAULT_SLICE_COUNT
+        count = int(os.environ.get("FAIR5G_SLICE_COUNT", DEFAULT_SLICE_COUNT))
+        return {s.index: s.ue_mininet_ip for s in build_slice_specs(count)}
+    except Exception:
+        return {}
+
+
+_UE_IPS = _ue_ip_defaults()
+UE1_IP = os.environ.get("UE1_IP", _UE_IPS.get(1, ""))
+UE2_IP = os.environ.get("UE2_IP", _UE_IPS.get(2, ""))
 
 # Queries Prometheus organizadas por categoria
 QUERIES = {

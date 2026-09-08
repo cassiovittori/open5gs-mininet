@@ -11,7 +11,11 @@ if [[ ${#ue_files[@]} -eq 0 ]]; then
   exit 1
 fi
 
-GNB_IP="$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' gnb)"
+# O gNB e dual-homed (core + acesso). Um `range` sobre .Networks concatenaria os dois
+# IPs numa string so ("10.33.33.1810.34.0.5") sem dar erro, e o UE nunca acharia o gNB.
+# Os UEs falam com a perna de ACESSO, entao o indice da rede tem que ser explicito.
+ACCESS_NETWORK="${FAIR5G_ACCESS_NETWORK:-fair5g-access}"
+GNB_IP="$(sudo docker inspect -f "{{index .NetworkSettings.Networks \"$ACCESS_NETWORK\" \"IPAddress\"}}" gnb)"
 if [[ -z "$GNB_IP" ]]; then
   echo "[render] Não consegui obter IP do container gnb."
   exit 1
