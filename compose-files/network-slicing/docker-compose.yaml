@@ -135,10 +135,15 @@ services:
     container_name: gnb
     image: "ghcr.io/borjis131/gnb:v3.2.7"
     command: "-c /UERANSIM/config/gnb.yaml"
+    # Dual-homed: perna no core (NGAP/GTP-U) + perna na rede de acesso (link de rádio
+    # simulado com os UEs). É a fronteira entre acesso e transporte, como um gNB real.
     networks:
       open5gs:
         aliases:
           - gnb.ueransim.org
+      fair5g-access:
+        aliases:
+          - gnb.access
     configs:
       - source: gnb_config
         target: /UERANSIM/config/gnb.yaml
@@ -170,10 +175,16 @@ services:
     container_name: blackbox
     ports:
       - "9115:9115"
+    # Exceção de observabilidade: o job `blackbox-ping-slices` sonda os IPs dos UEs, que
+    # ficam na rede de acesso. Sem essa perna o probe morre e os painéis de latência por
+    # fatia ficam vazios. Como o gNB, não roteia entre as redes — só origina os probes.
     networks:
       open5gs:
         aliases:
           - blackbox.open5gs.org
+      fair5g-access:
+        aliases:
+          - blackbox.access
     restart: always
     cap_add:
       - NET_RAW
@@ -229,6 +240,7 @@ services:
 
 
 networks:
+  # Rede de transporte do core (N2/N3/SBI). Nenhum UE tem presença aqui.
   open5gs:
     name: open5gs
     driver: bridge
@@ -237,6 +249,19 @@ networks:
     ipam:
       config:
         - subnet: 10.33.33.0/24
+
+  # Rede de acesso: só os UEs (via switch OVS) e a perna de rádio do gNB. O gNB é a
+  # única ponte entre as duas redes, e faz isso em nível de aplicação (termina o RLS de
+  # um lado, origina NGAP/GTP-U do outro) — não roteia pacotes entre as pernas. Assim
+  # o core fica inalcançável para um UE por topologia, não por regra de firewall.
+  fair5g-access:
+    name: fair5g-access
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-access
+    ipam:
+      config:
+        - subnet: 10.34.0.0/24
 
 volumes:
   db_data:

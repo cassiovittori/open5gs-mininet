@@ -11,7 +11,12 @@ QOS_PROFILES = [
     {"index": 2, "ambr_down_mbps": 10, "ambr_up_mbps": 10},
 ]
 
-_UE_MININET_BASE_OCTET = 199
+# Os UEs ficam na rede de ACESSO (10.34.0.0/24), separada da rede de transporte do
+# core (10.33.33.0/24). O gNB é dual-homed e é a única ponte entre as duas — assim o
+# core é inalcançável a partir de um UE por topologia, não por regra de firewall.
+ACCESS_SUBNET = "10.34.0.0/24"
+_UE_ACCESS_PREFIX = "10.34.0"
+_UE_ACCESS_BASE_OCTET = 199
 _UPF_SUBNET_BASE_OCTET = 44
 _IMSI_PREFIX_1_9 = "123456789"
 _IMSI_PREFIX_10_99 = "12345678"
@@ -57,7 +62,7 @@ def build_slice_specs(count) -> list[SliceSpec]:
     for index in range(1, count + 1):
         profile = QOS_PROFILES[(index - 1) % len(QOS_PROFILES)]
         subnet_octet = _UPF_SUBNET_BASE_OCTET + index
-        ue_octet = _UE_MININET_BASE_OCTET + index
+        ue_octet = _UE_ACCESS_BASE_OCTET + index
         specs.append(
             SliceSpec(
                 index=index,
@@ -66,7 +71,7 @@ def build_slice_specs(count) -> list[SliceSpec]:
                 imsi=f"00101{_msin(index)}",
                 upf_subnet=f"10.{subnet_octet}.0.0/16",
                 upf_gateway=f"10.{subnet_octet}.0.1",
-                ue_mininet_ip=f"10.33.33.{ue_octet}",
+                ue_mininet_ip=f"{_UE_ACCESS_PREFIX}.{ue_octet}",
                 qos_index=profile["index"],
                 ambr_down_mbps=profile["ambr_down_mbps"],
                 ambr_up_mbps=profile["ambr_up_mbps"],

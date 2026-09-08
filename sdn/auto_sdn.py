@@ -22,8 +22,13 @@ from fair5gctl.core.slicing import (
     build_slice_specs,
     other_subnets,
     meter_rate_kbps,
+    ACCESS_SUBNET,
     DEFAULT_SLICE_COUNT,
 )
+
+
+ACCESS_NETWORK = "fair5g-access"
+CORE_NETWORK = "open5gs"
 
 
 def get_slice_specs():
@@ -171,7 +176,29 @@ def _output_instrs(port, meter_id):
 
 
 def install_slice_flows(user: str, password: str, dpid: str, specs, ports: dict,
-                        port_core: str, meter_ids: dict) -> bool:
+                        port_core: str, meter_ids: dict, gnb_ip: str = "",
+                        probe_ips: list = None) -> bool:
+    # Modelo whitelist: o único destino que um UE precisa alcançar é o gNB (o ue*.yaml
+    # renderizado contém exatamente um IP, o do gNB — o UE não conhece endereço de AMF,
+    # SMF, UPF ou NRF). Antes o uplink era `src=UE -> OUTPUT core` para qualquer destino,
+    # o que deixava o UE alcançar todo o plano de gerência do core, que fica na mesma /24.
+    # O probe do blackbox (job `blackbox-ping-slices`) manda ICMP para os UEs; a
+    # RESPOSTA do UE sai como `src=UE, dst=blackbox` e cairia no deny-all. Exceção
+    # explícita de observabilidade — sem ela os painéis de latência por fatia zeram.
+    allowed_dsts = [gnb_ip] + list(probe_ips or [])
+    allowed_dsts = [ip for ip in allowed_dsts if ip]
+
+    def allow_flow(ue_ip, dst_ip, meter_id):
+        return {
+            "priority": 300, "isPermanent": True,
+            "selector": {"criteria": [
+                {"type": "ETH_TYPE", "ethType": "0x0800"},
+                {"type": "IPV4_SRC", "ip": f"{ue_ip}/32"},
+                {"type": "IPV4_DST", "ip": f"{dst_ip}/32"},
+            ]},
+            "treatment": {"instructions": _output_instrs(port_core, meter_id)},
+        }
+
     def isolation_flow(ue_ip, deny_subnet):
         return {
             "priority": 200, "isPermanent": True,
@@ -184,13 +211,18 @@ def install_slice_flows(user: str, password: str, dpid: str, specs, ports: dict,
         }
 
     def uplink_flow(ue_ip, meter_id):
+        # Sem gnb_ip conhecido cai no comportamento antigo (permissivo) para não
+        # derrubar o ambiente; com gnb_ip vira o deny-all que fecha o whitelist.
+        priority = 150 if gnb_ip else 100
+        treatment = ({"instructions": [{"type": "NOACTION"}]} if gnb_ip
+                     else {"instructions": _output_instrs(port_core, meter_id)})
         return {
-            "priority": 100, "isPermanent": True,
+            "priority": priority, "isPermanent": True,
             "selector": {"criteria": [
                 {"type": "ETH_TYPE", "ethType": "0x0800"},
                 {"type": "IPV4_SRC", "ip": f"{ue_ip}/32"},
             ]},
-            "treatment": {"instructions": _output_instrs(port_core, meter_id)},
+            "treatment": treatment,
         }
 
     def downlink_flow(ue_ip, port_ue, meter_id):
@@ -203,8 +235,15 @@ def install_slice_flows(user: str, password: str, dpid: str, specs, ports: dict,
             "treatment": {"instructions": _output_instrs(port_ue, meter_id)},
         }
 
+    if not gnb_ip:
+        print("[AVISO] IP do gNB não informado — flows de uplink ficam permissivos "
+              "(UE alcança todo o core). Whitelist desativado.")
+
     flows = []
     for spec in specs:
+        meter_id = meter_ids.get(spec.index)
+        for dst_ip in allowed_dsts:
+            flows.append(allow_flow(spec.ue_mininet_ip, dst_ip, meter_id))
         for deny_subnet in other_subnets(specs, spec.index):
             flows.append(isolation_flow(spec.ue_mininet_ip, deny_subnet))
     for spec in specs:
@@ -277,6 +316,23 @@ def install_slice_meters(user: str, password: str, dpid: str, specs) -> dict:
     return meter_ids
 
 
+def get_container_network_ip(container_name: str, network_name: str = "open5gs") -> str:
+    result = run(
+        f"docker inspect -f '{{{{index .NetworkSettings.Networks \"{network_name}\" \"IPAddress\"}}}}' {container_name}",
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def get_docker_network_subnet(network_name: str = "open5gs") -> str:
+    out = run(f"docker network inspect {network_name}", check=False).stdout
+    try:
+        return json.loads(out)[0]["IPAM"]["Config"][0]["Subnet"]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        print(f"[AVISO] não consegui descobrir a subnet da rede {network_name}")
+        return ""
+
+
 def get_container_bridge_ip(container_name: str) -> str:
     result = run(
         f"docker inspect -f '{{{{.NetworkSettings.Networks.bridge.IPAddress}}}}' {container_name}",
@@ -304,7 +360,7 @@ def install_mgmt_isolation_rules(specs, bridge_ips: dict):
     print(f"Isolamento mgmt plane: {bridge_ips}")
 
 
-def install_upf_isolation_rules(specs):
+def install_upf_isolation_rules(specs, core_subnet: str = ""):
     # O isolamento precisa ser aplicado DENTRO do container da UPF, não no host: a UPF
     # tem uma regra própria de MASQUERADE em POSTROUTING (`!ogstun 10.4X.0.0/16 -> 0.0.0.0/0`)
     # que reescreve o IP de origem da sessão PDU antes do pacote chegar ao host. Regras no
@@ -312,21 +368,33 @@ def install_upf_isolation_rules(specs):
     # FORWARD roda antes do POSTROUTING, então o IP original ainda está visível.
     for spec in specs:
         cname = f"upf{spec.index}"
-        for other in other_subnets(specs, spec.index):
-            docker_exec(
-                cname,
-                f"while iptables -D FORWARD -s {spec.upf_subnet} -d {other} "
-                "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP 2>/dev/null; do :; done",
-                check=False,
-            )
-            result = docker_exec(
-                cname,
-                f"iptables -I FORWARD 1 -s {spec.upf_subnet} -d {other} "
-                "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP",
-                check=False,
-            )
-            if result.returncode != 0:
-                print(f"[AVISO] não consegui aplicar isolamento em {cname} → {other}")
+        # Além das outras fatias, a subnet do próprio core: tráfego de sessão PDU não deve
+        # alcançar o plano de gerência (AMF/SMF/NRF/UPFs vizinhas). Bloquear o destino não
+        # afeta a saída para a internet — o gateway em 10.33.33.1 é só next-hop, o campo de
+        # destino do pacote continua sendo o endereço externo.
+        deny_targets = list(other_subnets(specs, spec.index))
+        if core_subnet:
+            deny_targets.append(core_subnet)
+
+        # FORWARD cobre o que ATRAVESSA a UPF; INPUT cobre o que é destinado À PRÓPRIA
+        # UPF (ex.: um UE pingando o IP de gerência da UPF onde sua sessão termina —
+        # esse tráfego é entregue localmente e nunca passa pelo FORWARD).
+        for chain in ("FORWARD", "INPUT"):
+            for target in deny_targets:
+                docker_exec(
+                    cname,
+                    f"while iptables -D {chain} -s {spec.upf_subnet} -d {target} "
+                    "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP 2>/dev/null; do :; done",
+                    check=False,
+                )
+                result = docker_exec(
+                    cname,
+                    f"iptables -I {chain} 1 -s {spec.upf_subnet} -d {target} "
+                    "-m comment --comment FAIR5G-SLICE-ISO-UPF -j DROP",
+                    check=False,
+                )
+                if result.returncode != 0:
+                    print(f"[AVISO] não consegui aplicar isolamento em {cname} {chain} → {target}")
     print(f"Isolamento aplicado dentro das UPFs (antes do masquerade) em {len(specs)} fatia(s).")
 
 
@@ -457,7 +525,10 @@ def run_topology():
     ensure_onos()
 
     print("Configurando Cabos Virtuais...")
-    bridge_name = get_docker_bridge_name("open5gs")
+    # O veth liga o switch OVS (onde ficam os UEs) a rede de ACESSO. O core fica em
+    # outra bridge, sem caminho L2/L3 a partir daqui — a isolacao do Docker entre redes
+    # bloqueia access<->core, e o gNB e a unica travessia (em nivel de aplicacao).
+    bridge_name = get_docker_bridge_name(ACCESS_NETWORK)
     ensure_veth_and_iptables(bridge_name)
 
     user = os.getenv("FAIR5G_ONOS_USER", "onos")
@@ -507,8 +578,14 @@ def run_topology():
         if missing:
             raise RuntimeError(f"Portas não encontradas no ONOS: {missing} (ports={ports}, core={port_core})")
 
+        gnb_ip = get_container_network_ip("gnb", ACCESS_NETWORK)
+        probe_ip = get_container_network_ip("blackbox", ACCESS_NETWORK)
+        print(f"gNB na rede de acesso: {gnb_ip or 'NÃO DESCOBERTO'}")
+        print(f"Probe (blackbox) na rede de acesso: {probe_ip or 'ausente'}")
+
         meter_ids = install_slice_meters(user, password, dpid, specs)
-        install_slice_flows(user, password, dpid, specs, ports, port_core, meter_ids)
+        install_slice_flows(user, password, dpid, specs, ports, port_core, meter_ids,
+                            gnb_ip, [probe_ip] if probe_ip else [])
         # fwd fica ativo: nossos flows proativos já casam com todo pacote IPv4 de/para
         # um UE (table-miss nunca ocorre para esse tráfego), então o forwarding reativo
         # só é de fato acionado para ARP — que não tem flow próprio e travava o
@@ -531,7 +608,7 @@ def run_topology():
         install_mgmt_isolation_rules(specs, bridge_ips)
 
         print("Configurando isolamento do plano de dados nas UPFs...")
-        install_upf_isolation_rules(specs)
+        install_upf_isolation_rules(specs, get_docker_network_subnet("open5gs"))
 
         print("Iniciando Conexao 5G (UERANSIM)...")
         for spec in specs:
